@@ -110,7 +110,7 @@ pub type SocketBuffer<'a> = RingBuffer<'a, u8>;
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum State {
-    Closed,
+    Closed(ClosedReason),
     Listen,
     SynSent,
     SynReceived,
@@ -123,10 +123,21 @@ pub enum State {
     TimeWait,
 }
 
+/// The reason a TCP socket has been closed for.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum ClosedReason {
+    NotInitialized,
+    Timeout,
+    Reset,
+    Finish,
+    Abort,
+}
+
 impl fmt::Display for State {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            State::Closed => write!(f, "CLOSED"),
+            State::Closed(_) => write!(f, "CLOSED"),
             State::Listen => write!(f, "LISTEN"),
             State::SynSent => write!(f, "SYN-SENT"),
             State::SynReceived => write!(f, "SYN-RECEIVED"),
@@ -516,7 +527,7 @@ impl<'a> Socket<'a> {
         let rx_cap_log2 = mem::size_of::<usize>() * 8 - rx_capacity.leading_zeros() as usize;
 
         Socket {
-            state: State::Closed,
+            state: State::Closed(ClosedReason::NotInitialized),
             timer: Timer::new(),
             rtte: RttEstimator::default(),
             assembler: Assembler::new(),
@@ -816,7 +827,7 @@ impl<'a> Socket<'a> {
         let rx_cap_log2 =
             mem::size_of::<usize>() * 8 - self.rx_buffer.capacity().leading_zeros() as usize;
 
-        self.state = State::Closed;
+        self.state = State::Closed(ClosedReason::Timeout);
         self.timer = Timer::new();
         self.rtte = RttEstimator::default();
         self.assembler = Assembler::new();
@@ -995,10 +1006,10 @@ impl<'a> Socket<'a> {
     pub fn close(&mut self) {
         match self.state {
             // In the LISTEN state there is no established connection.
-            State::Listen => self.set_state(State::Closed),
+            State::Listen => self.set_state(State::Closed(ClosedReason::Timeout)),
             // In the SYN-SENT state the remote endpoint is not yet synchronized and, upon
             // receiving an RST, will abort the connection.
-            State::SynSent => self.set_state(State::Closed),
+            State::SynSent => self.set_state(State::Closed(ClosedReason::Reset)),
             // In the SYN-RECEIVED, ESTABLISHED and CLOSE-WAIT states the transmit half
             // of the connection is open, and needs to be explicitly closed with a FIN.
             State::SynReceived | State::Established => self.set_state(State::FinWait1),
@@ -1011,7 +1022,7 @@ impl<'a> Socket<'a> {
             | State::Closing
             | State::TimeWait
             | State::LastAck
-            | State::Closed => (),
+            | State::Closed(_) => (),
         }
     }
 
@@ -1023,7 +1034,7 @@ impl<'a> Socket<'a> {
     /// In terms of the TCP state machine, the socket may be in any state and is moved to
     /// the `CLOSED` state.
     pub fn abort(&mut self) {
-        self.set_state(State::Closed);
+        self.set_state(State::Closed(ClosedReason::Abort));
     }
 
     /// Return whether the socket is passively listening for incoming connections.
@@ -1048,7 +1059,7 @@ impl<'a> Socket<'a> {
     #[inline]
     pub fn is_open(&self) -> bool {
         match self.state {
-            State::Closed => false,
+            State::Closed(_) => false,
             State::TimeWait => false,
             _ => true,
         }
@@ -1069,7 +1080,7 @@ impl<'a> Socket<'a> {
     #[inline]
     pub fn is_active(&self) -> bool {
         match self.state {
-            State::Closed => false,
+            State::Closed(_) => false,
             State::TimeWait => false,
             State::Listen => false,
             _ => true,
@@ -1442,7 +1453,7 @@ impl<'a> Socket<'a> {
     }
 
     pub(crate) fn accepts(&self, _cx: &mut Context, ip_repr: &IpRepr, repr: &TcpRepr) -> bool {
-        if self.state == State::Closed {
+        if let State::Closed(_) = self.state {
             return false;
         }
 
@@ -1733,7 +1744,7 @@ impl<'a> Socket<'a> {
             // RSTs in any other state close the socket.
             (_, TcpControl::Rst) => {
                 tcp_trace!("received RST");
-                self.set_state(State::Closed);
+                self.set_state(State::Closed(ClosedReason::Reset));
                 self.tuple = None;
                 return None;
             }
@@ -1893,7 +1904,7 @@ impl<'a> Socket<'a> {
             (State::LastAck, TcpControl::None) => {
                 if ack_of_fin {
                     // Clear the remote endpoint, or we'll send an RST there.
-                    self.set_state(State::Closed);
+                    self.set_state(State::Closed(ClosedReason::Finish));
                     self.tuple = None;
                 } else {
                     self.timer.set_for_idle(cx.now(), self.keep_alive);
@@ -2234,7 +2245,7 @@ impl<'a> Socket<'a> {
         if self.timed_out(cx.now()) {
             // If a timeout expires, we should abort the connection.
             net_debug!("timeout exceeded");
-            self.set_state(State::Closed);
+            self.set_state(State::Closed(ClosedReason::Timeout));
         } else if !self.seq_to_transmit(cx) {
             if let Some(retransmit_delta) = self.timer.should_retransmit(cx.now()) {
                 // If a retransmit timer expired, we should resend data starting at the last ACK.
@@ -2271,7 +2282,7 @@ impl<'a> Socket<'a> {
         } else if self.window_to_update() {
             // If we have window length increase to advertise, do it.
             tcp_trace!("outgoing segment will update window");
-        } else if self.state == State::Closed {
+        } else if let State::Closed(_) = self.state {
             // If we need to abort the connection, do it.
             tcp_trace!("outgoing segment will abort connection");
         } else if self.timer.should_keep_alive(cx.now()) {
@@ -2322,7 +2333,7 @@ impl<'a> Socket<'a> {
         match self.state {
             // We transmit an RST in the CLOSED state. If we ended up in the CLOSED state
             // with a specified endpoint, it means that the socket was aborted.
-            State::Closed => {
+            State::Closed(_) => {
                 repr.control = TcpControl::Rst;
             }
 
@@ -2494,7 +2505,7 @@ impl<'a> Socket<'a> {
                 .set_for_retransmit(cx.now(), self.rtte.retransmission_timeout());
         }
 
-        if self.state == State::Closed {
+        if let State::Closed(_) = self.state {
             // When aborting a connection, forget about it after sending a single RST packet.
             self.tuple = None;
             #[cfg(feature = "async")]
@@ -2516,7 +2527,7 @@ impl<'a> Socket<'a> {
         } else if self.remote_last_ts.is_none() {
             // Socket stopped being quiet recently, we need to acquire a timestamp.
             PollAt::Now
-        } else if self.state == State::Closed {
+        } else if let State::Closed(_) = self.state {
             // Socket was aborted, we have an RST packet to transmit.
             PollAt::Now
         } else if self.seq_to_transmit(cx) {
@@ -2946,7 +2957,7 @@ mod test {
     #[test]
     fn test_closed_reject() {
         let mut s = socket();
-        assert_eq!(s.state, State::Closed);
+        assert_eq!(s.state, State::Closed(ClosedReason::NotInitialized));
 
         let tcp_repr = TcpRepr {
             control: TcpControl::Syn,
@@ -2972,7 +2983,7 @@ mod test {
     fn test_closed_close() {
         let mut s = socket();
         s.close();
-        assert_eq!(s.state, State::Closed);
+        assert_eq!(s.state, State::Closed(ClosedReason::NotInitialized));
     }
 
     // =========================================================================================//
@@ -3153,7 +3164,7 @@ mod test {
     fn test_listen_close() {
         let mut s = socket_listen();
         s.close();
-        assert_eq!(s.state, State::Closed);
+        assert_eq!(s.state, State::Closed(ClosedReason::Timeout));
     }
 
     // =========================================================================================//
@@ -3582,7 +3593,7 @@ mod test {
                 ..SEND_TEMPL
             }
         );
-        assert_eq!(s.state, State::Closed);
+        assert_eq!(s.state, State::Closed(ClosedReason::Reset));
     }
 
     #[test]
@@ -3721,7 +3732,7 @@ mod test {
     fn test_syn_sent_close() {
         let mut s = socket();
         s.close();
-        assert_eq!(s.state, State::Closed);
+        assert_eq!(s.state, State::Closed(ClosedReason::NotInitialized));
     }
 
     #[test]
@@ -4485,7 +4496,7 @@ mod test {
                 ..SEND_TEMPL
             }
         );
-        assert_eq!(s.state, State::Closed);
+        assert_eq!(s.state, State::Closed(ClosedReason::Reset));
     }
 
     #[test]
@@ -4500,7 +4511,7 @@ mod test {
                 ..SEND_TEMPL
             }
         );
-        assert_eq!(s.state, State::Closed);
+        assert_eq!(s.state, State::Closed(ClosedReason::Reset));
     }
 
     #[test]
@@ -4515,7 +4526,7 @@ mod test {
     fn test_established_abort() {
         let mut s = socket_established();
         s.abort();
-        assert_eq!(s.state, State::Closed);
+        assert_eq!(s.state, State::Closed(ClosedReason::Abort));
         recv!(
             s,
             [TcpRepr {
@@ -4840,7 +4851,7 @@ mod test {
         );
         assert_eq!(s.state, State::TimeWait);
         recv_nothing!(s, time 60_000);
-        assert_eq!(s.state, State::Closed);
+        assert_eq!(s.state, State::Closed(ClosedReason::Timeout));
     }
 
     // =========================================================================================//
@@ -4902,7 +4913,7 @@ mod test {
                 ..SEND_TEMPL
             }
         );
-        assert_eq!(s.state, State::Closed);
+        assert_eq!(s.state, State::Closed(ClosedReason::Finish));
     }
 
     #[test]
@@ -4939,7 +4950,7 @@ mod test {
                 ..SEND_TEMPL
             }
         );
-        assert_eq!(s.state, State::Closed);
+        assert_eq!(s.state, State::Closed(ClosedReason::Finish));
     }
 
     #[test]
@@ -5037,7 +5048,7 @@ mod test {
                 ..SEND_TEMPL
             }
         );
-        assert_eq!(s.state, State::Closed);
+        assert_eq!(s.state, State::Closed(ClosedReason::Finish));
     }
 
     #[test]
@@ -6644,7 +6655,7 @@ mod test {
             window_scale: None,
             ..RECV_TEMPL
         }));
-        assert_eq!(s.state, State::Closed);
+        assert_eq!(s.state, State::Closed(ClosedReason::Timeout));
     }
 
     #[test]
@@ -6684,7 +6695,7 @@ mod test {
             ack_number: Some(REMOTE_SEQ + 1),
             ..RECV_TEMPL
         }));
-        assert_eq!(s.state, State::Closed);
+        assert_eq!(s.state, State::Closed(ClosedReason::Timeout));
     }
 
     #[test]
@@ -6731,7 +6742,7 @@ mod test {
             ..RECV_TEMPL
         }));
         recv_nothing!(s, time 205);
-        assert_eq!(s.state, State::Closed);
+        assert_eq!(s.state, State::Closed(ClosedReason::Timeout));
     }
 
     #[test]
@@ -6750,7 +6761,7 @@ mod test {
             ack_number: Some(REMOTE_SEQ + 1),
             ..RECV_TEMPL
         }));
-        assert_eq!(s.state, State::Closed);
+        assert_eq!(s.state, State::Closed(ClosedReason::Timeout));
     }
 
     #[test]
@@ -6769,7 +6780,7 @@ mod test {
             ack_number: Some(REMOTE_SEQ + 1 + 1),
             ..RECV_TEMPL
         }));
-        assert_eq!(s.state, State::Closed);
+        assert_eq!(s.state, State::Closed(ClosedReason::Timeout));
     }
 
     #[test]
